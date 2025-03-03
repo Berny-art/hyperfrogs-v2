@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-// ERC721A, ERC2981, and OpenZeppelin contracts
-import "../erc721a/contracts/ERC721A.sol";
+// OpenZeppelin Contracts
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/common/ERC2981.sol";
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
@@ -62,8 +62,7 @@ interface IHyperFrogs {
     function transferFrom(address from, address to, uint256 tokenId) external;
     function tokenURI(uint256 tokenId) external view returns (string memory);
     function buildSVG(uint256 tokenId) external view returns (string memory);
-    function getFrogTraits(uint256 tokenId) external view returns (string memory);
-    function getTokenTraits(uint256 tokenId) external view returns (
+    function tokenTraits(uint256 tokenId) external view returns (
         bool oneOfOne,
         uint oneOfOneIndex,
         uint backdrop,
@@ -77,10 +76,16 @@ interface IHyperFrogs {
 }
 
 /// --------------------------------------------------------------------------
-/// HyperFrogsV2 Migration Contract using AccessControl
+/// HyperFrogsV2 Migration Contract using ERC721 and AccessControl
 /// --------------------------------------------------------------------------
-contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2981 {
+contract HyperFrogsV2 is ERC721, AccessControl, Pausable, ReentrancyGuard, ERC2981 {
     using Strings for uint256;
+    uint256 public totalMigrated;
+    
+    // -----------------------------------------------------------------------
+    // Events
+    // -----------------------------------------------------------------------    
+    event TokenMigrated(address indexed owner, uint256 indexed tokenId, uint256 migrationBatch);
 
     // -----------------------------------------------------------------------
     // Struct & State Variables
@@ -96,6 +101,15 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
         uint body;
         uint feet;
     }
+
+    // -----------------------------------------------------------------------
+    // Custom Errors
+    // -----------------------------------------------------------------------
+    error TokenAlreadyMigrated(uint256 tokenId);
+    error NotOwnerOfOldNFT(uint256 tokenId, address actual, address sender);
+    error NoTokenIDsProvided();
+    error BatchSizeToLarge();
+    error TokenNotMigratedYet(uint256 tokenId);
 
     IHyperFrogs public oldContract;
     mapping(uint256 => bool) public claimed;
@@ -116,6 +130,9 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
     // -----------------------------------------------------------------------
     event TokenMigrated(address indexed owner, uint256 indexed tokenId);
 
+    // Optional debug event to help with troubleshooting ownerOf values
+    event DebugOwner(address actualOwner);
+
     // -----------------------------------------------------------------------
     // Constructor
     // -----------------------------------------------------------------------
@@ -130,7 +147,7 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
         address _frogsMouth,
         address _frogsFeet
     )
-        ERC721A("HyperFrogs V2", "HYF2")
+        ERC721("Hyper Frogs", "HYF2")
         ERC2981()
     {
         require(_oldContract != address(0), "Invalid old contract address");
@@ -148,13 +165,13 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
     }
 
     // -----------------------------------------------------------------------
-    // ERC2981, ERC721A, and AccessControl Interface Support
+    // ERC2981, ERC721, and AccessControl Interface Support
     // -----------------------------------------------------------------------
     /**
-     * @notice Override supportsInterface to combine ERC721A, ERC2981, and AccessControl interfaces.
+     * @notice Override supportsInterface to combine ERC721, ERC2981, and AccessControl interfaces.
      */
-    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC721A, ERC2981, AccessControl) returns (bool) {
-        return ERC721A.supportsInterface(interfaceId) ||
+    function supportsInterface(bytes4 interfaceId) public view virtual override(ERC721, ERC2981, AccessControl) returns (bool) {
+        return ERC721.supportsInterface(interfaceId) ||
                ERC2981.supportsInterface(interfaceId) ||
                AccessControl.supportsInterface(interfaceId);
     }
@@ -171,16 +188,17 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
      */
     function batchClaim(uint256[] calldata tokenIds) external whenNotPaused nonReentrant {
         uint256 length = tokenIds.length;
-        require(length > 0, "No token IDs provided");
+        uint256 batchId = totalMigrated; // Use as a batch identifier
+        if (length == 0) revert NoTokenIDsProvided();
+        if (length > 20) revert BatchSizeToLarge();
 
         for (uint256 i = 0; i < length; i++) {
             uint256 tokenId = tokenIds[i];
-            require(!claimed[tokenId], "Token already migrated");
-            require(oldContract.ownerOf(tokenId) == msg.sender, "Not owner of old NFT");
+            if (claimed[tokenId]) revert TokenAlreadyMigrated(tokenId);
+            address actualOwner = oldContract.ownerOf(tokenId);
+            if (actualOwner != msg.sender) revert NotOwnerOfOldNFT(tokenId, actualOwner, msg.sender);
 
-            claimed[tokenId] = true;
-
-            // Retrieve traits from the old contract and store them
+            // Retrieve traits from the old contract using its public tokenTraits mapping
             (
                 bool oneOfOne,
                 uint oneOfOneIndex,
@@ -191,7 +209,7 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
                 uint mouth,
                 uint body,
                 uint feet
-            ) = oldContract.getTokenTraits(tokenId);
+            ) = oldContract.tokenTraits(tokenId);
 
             tokenTraits[tokenId] = TraitStruct({
                 oneOfOne: oneOfOne,
@@ -205,8 +223,13 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
                 feet: feet
             });
 
-            // Remint the NFT with the same tokenId
+            // Mint the NFT with the same tokenId
             _safeMint(msg.sender, tokenId);
+
+            // Mark token as claimed after minting succeeds
+            claimed[tokenId] = true;
+            totalMigrated++;
+            emit TokenMigrated(msg.sender, tokenId, batchId);
 
             // Attempt to burn the old NFT; if burn fails, transfer it to the old contract's address (lockup)
             try oldContract.burn(tokenId) {
@@ -217,6 +240,18 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
 
             emit TokenMigrated(msg.sender, tokenId);
         }
+    }
+
+    /**
+     * @notice Check the migration status of multiple tokens.
+     * Returns an array of booleans indicating whether each token has been migrated.
+     */
+    function checkMigrationStatus(uint256[] calldata tokenIds) external view returns (bool[] memory statuses) {
+        statuses = new bool[](tokenIds.length);
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            statuses[i] = claimed[tokenIds[i]];
+        }
+        return statuses;
     }
 
     // -----------------------------------------------------------------------
@@ -243,8 +278,9 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
     /**
      * @notice Rebuilds the on-chain SVG using stored traits.
      */
+    
     function buildSVG(uint tokenId) public view returns (string memory) {
-        require(_exists(tokenId), "Token does not exist");
+        if (!claimed[tokenId]) revert TokenNotMigratedYet(tokenId);
         TraitStruct memory traits = tokenTraits[tokenId];
 
         if (traits.oneOfOne) {
@@ -373,6 +409,44 @@ contract HyperFrogsV2 is ERC721A, AccessControl, Pausable, ReentrancyGuard, ERC2
         uint256 length = tokenIds.length;
         for (uint256 i = 0; i < length; i++) {
             claimed[tokenIds[i]] = true;
+        }
+    }
+
+    function adminMigrate(uint256[] calldata tokenIds, address recipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            uint256 tokenId = tokenIds[i];
+            require(!claimed[tokenId], "Token already migrated");
+            
+            // Retrieve traits from old contract
+            (
+                bool oneOfOne,
+                uint oneOfOneIndex,
+                uint backdrop,
+                uint hat,
+                uint eyesIndex,
+                bool eyesIsA,
+                uint mouth,
+                uint body,
+                uint feet
+            ) = oldContract.tokenTraits(tokenId);
+            
+            tokenTraits[tokenId] = TraitStruct({
+                oneOfOne: oneOfOne,
+                oneOfOneIndex: oneOfOneIndex,
+                backdrop: backdrop,
+                hat: hat,
+                eyesIndex: eyesIndex,
+                eyesIsA: eyesIsA,
+                mouth: mouth,
+                body: body,
+                feet: feet
+            });
+            
+            _safeMint(recipient, tokenId);
+            claimed[tokenId] = true;
+            totalMigrated++;
+            
+            emit TokenMigrated(recipient, tokenId, totalMigrated);
         }
     }
 }
